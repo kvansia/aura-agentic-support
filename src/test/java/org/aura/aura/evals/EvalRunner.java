@@ -6,7 +6,7 @@ import org.aura.aura.classification.ClassificationResult;
 import org.aura.aura.classification.ClassifierPromptProvider;
 import org.aura.aura.classification.TicketClassificationService;
 import org.aura.aura.resolver.Resolution;
-import org.aura.aura.resolver.ResolverService;
+import org.aura.aura.resolver.ResolverToolLoop;
 import org.aura.aura.retrieval.RetrievalService;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -62,11 +62,11 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
 
     private final TicketClassificationService classifier;
 
-    // D2: the runner injects the INNER ResolverService bean — the one CachedResolutionService wraps
+    // D2: the runner injects the INNER resolver bean (Day 17: the ResolverToolLoop) — the one CachedResolutionService wraps
     // (ADR-019) — NOT the caching wrapper. Eval traffic must never read from or write to Redis: a
     // cached answer would score a PAST prompt version, and a cache WRITE would pollute production
     // with eval traffic. Anthropic prefix caching stays on (it changes billing, not output).
-    private final ResolverService resolver;
+    private final ResolverToolLoop resolver;
 
     // Day 14: retrieval is a separate step now, so the harness performs it — the same call
     // CachedResolutionService makes, minus the cache. Injecting RetrievalService rather than letting
@@ -85,7 +85,7 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
     private final EvalScorer scorer = new EvalScorer();
 
     @Autowired
-    EvalRunner(TicketClassificationService classifier, ResolverService resolver,
+    EvalRunner(TicketClassificationService classifier, ResolverToolLoop resolver,
                RetrievalService retrieval,
                ResolverPromptProvider resolverPrompts, ClassifierPromptProvider classifierPrompts) {
         this.classifier = classifier;

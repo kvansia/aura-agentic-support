@@ -15,6 +15,8 @@ import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import org.aura.aura.ResolverPromptProvider;
 import org.aura.aura.retrieval.ContextBlock;
 import org.aura.aura.retrieval.SourceRef;
+import org.aura.aura.tools.ToolRegistry;
+import org.aura.aura.tools.backoffice.FakeTicketService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -22,6 +24,7 @@ import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.ComponentScan;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.context.TestPropertySource;
@@ -42,7 +45,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Behavioural tests for the Day 8 resilience policy on {@link ResolverService#resolve(String)}. Each
+ * Behavioural tests for the Day 8 resilience policy on {@link ResolverService#ask}. Each
  * test name states one sentence of the policy; together they ARE the policy's documentation.
  *
  * <p>These run against a real (sliced) Spring context, not a hand-constructed {@code new
@@ -84,7 +87,12 @@ class ResolverResilienceTest {
     // ResolverService, so the policy under test now wraps a pure "ask Claude" call. That is not the
     // test being simplified, it is the property being preserved: a retry must not re-run a billable
     // embedding, and every attempt must ask about the SAME context it started with.
-    @Import({ResolverService.class, ResolverPromptProvider.class})
+    // Day 17: the policy is on ResolverService.ask (one model call), and the tests drive it through the
+    // ResolverToolLoop — the real caller — so what is proven is that the proxy is live on the path
+    // production takes. The tool package is scanned in whole (definitions, registry, executors, fakes)
+    // so the registry boot check runs here too.
+    @Import({ResolverService.class, ResolverToolLoop.class, ResolverPromptProvider.class})
+    @ComponentScan(basePackageClasses = ToolRegistry.class)
     static class ResilienceTestConfig {
         // The one external dependency is faked. Deep stubs let client.messages().create(...) be stubbed
         // without naming the intermediate service type. Autowired into the test as the SAME instance.
@@ -98,10 +106,13 @@ class ResolverResilienceTest {
     AnthropicClient client;
 
     @Autowired
-    ResolverService resolver; // the AOP-proxied bean — annotations are live here
+    ResolverToolLoop resolver; // calls the AOP-proxied ResolverService — annotations are live on every round
 
     @Autowired
     CircuitBreakerRegistry circuitBreakers;
+
+    @Autowired
+    FakeTicketService tickets; // the real in-memory ledger the loop's dispatch writes to
 
     @BeforeEach
     void resetSharedState() {
@@ -224,6 +235,35 @@ class ResolverResilienceTest {
         assertThat(resolution.escalationCause()).isEqualTo(EscalationCause.OUTPUT_UNUSABLE);
         assertThat(resolution.escalate()).isTrue();
         verify(client.messages(), times(3)).create(any(StructuredMessageCreateParams.class));
+    }
+
+    /**
+     * Day 17 — THE AIRBAG RULE, through the live proxy. Round 1 asks for a WRITE (a follow-up ticket);
+     * round 2's model call is rate-limited once and then succeeds.
+     *
+     * <p>What Resilience4j retries is round 2's single model call, re-sending the same immutable
+     * conversation — NOT the loop, and so NOT round 1's dispatch. Had the retried unit been "the whole
+     * resolve" (as it was before today), that 429 would have replayed the ticket creation. The ledger
+     * count is the assertion; the call count proves the retry actually happened.
+     */
+    @Test
+    void aRetryOnRoundTwoNeverReplaysRoundOnesWrite() {
+        StructuredMessage<ResolverOutput> wantsATicket = ToolTurns.toolUseTurn(ToolTurns.toolUse("toolu_w1",
+                "create_followup_ticket", "{\"team\":\"warehouse\",\"summary\":\"Check stock for SF-4412\"}"));
+        StructuredMessage<ResolverOutput> answer = okResponse();
+        int ticketsBefore = tickets.created().size();
+        when(client.messages().create(any(StructuredMessageCreateParams.class)))
+                .thenReturn(wantsATicket)
+                .thenThrow(rateLimited())
+                .thenReturn(answer);
+
+        Resolution resolution = resolver.resolve(TICKET, CONTEXT);
+
+        assertThat(resolution.status()).isEqualTo(ResolutionStatus.RESOLVED);
+        // round 1 (1) + round 2 [429, 200] (2) = 3 model calls ...
+        verify(client.messages(), times(3)).create(any(StructuredMessageCreateParams.class));
+        // ... and exactly ONE ticket.
+        assertThat(tickets.created()).hasSize(ticketsBefore + 1);
     }
 
     /** A clean end_turn whose payload is not a ResolverOutput — the gate-0 case. */

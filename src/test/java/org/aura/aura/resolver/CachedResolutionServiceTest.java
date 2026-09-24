@@ -8,6 +8,7 @@ import org.aura.aura.client.VoyageTransientException;
 import org.aura.aura.retrieval.ContextBlock;
 import org.aura.aura.retrieval.RetrievalService;
 import org.aura.aura.retrieval.SourceRef;
+import org.aura.aura.tools.ToolDefinitions;
 import org.aura.aura.web.dto.ResolveTicketRequest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -54,8 +55,9 @@ class CachedResolutionServiceTest {
     @Mock RetrievalService retrieval;
     @Mock CacheKeyFactory keys;
     @Mock ResolutionCache cache;
-    @Mock ResolverService resolver;
+    @Mock ResolverToolLoop resolver;
     @Mock ResolverPromptProvider prompts;
+    @Mock ToolDefinitions tools;
 
     @InjectMocks CachedResolutionService service;
 
@@ -310,6 +312,24 @@ class CachedResolutionServiceTest {
         when(retrieval.retrieve(TICKET)).thenThrow(ours);
 
         assertThatThrownBy(() -> service.resolve(REQUEST)).isSameAs(ours);
+    }
+
+    // ---------------------------------------------------------------- Day 17: tools in the key
+
+    // POLICY: the advertised tools are keyed as part of the static prefix, AHEAD of the system prompt
+    // (the order the API renders them) — so a tool edit orphans keys exactly like a prompt edit.
+    @Test
+    void theToolAdvertisementIsKeyedAheadOfTheSystemPrompt() {
+        when(tools.canonicalForm()).thenReturn("[TOOLS]");
+        when(prompts.systemPrompt()).thenReturn("SYSTEM");
+        stubKey();
+        when(retrieval.retrieve(TICKET)).thenReturn(CONTEXT);
+        when(cache.get(KEY)).thenReturn(Optional.of(resolution("cached", ResolutionStatus.RESOLVED)));
+
+        service.resolve(REQUEST);
+
+        verify(keys).resolutionKey(any(), any(), anyInt(), eq("[TOOLS]SYSTEM"), any(), any(),
+                anyDouble(), anyLong());
     }
 
     // ---------------------------------------------------------------- fixtures

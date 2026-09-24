@@ -8,10 +8,12 @@ import com.anthropic.models.messages.CacheControlEphemeral;
 import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.Model;
 import com.anthropic.models.messages.StopReason;
+import com.anthropic.models.messages.StructuredContentBlock;
 import com.anthropic.models.messages.StructuredMessage;
 import com.anthropic.models.messages.StructuredMessageCreateParams;
 import com.anthropic.models.messages.StructuredTextBlock;
 import com.anthropic.models.messages.TextBlockParam;
+import com.anthropic.models.messages.ToolUseBlock;
 import com.anthropic.models.messages.Usage;
 import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
@@ -22,6 +24,7 @@ import org.aura.aura.ResolverPromptProvider;
 import org.aura.aura.resilience.AnthropicTransientFailures;
 import org.aura.aura.retrieval.ContextBlock;
 import org.aura.aura.retrieval.SourceRef;
+import org.aura.aura.tools.ToolDefinitions;
 import org.springframework.stereotype.Service;
 
 import java.util.LinkedHashMap;
@@ -56,6 +59,9 @@ public class ResolverService {
     // Injected only so the fallback can report the breaker's actual state (OPEN vs HALF_OPEN vs
     // FORCED_OPEN) in its WARN line — that log becomes the Day 24 "how often do we degrade" metric.
     private final CircuitBreakerRegistry circuitBreakers;
+    // Day 17 (ADR-045): what the blocking request advertises. Read here, in the request builder, so the
+    // tools and the prompt that describes them are assembled in the one place that builds requests.
+    private final ToolDefinitions tools;
 
     // Day 14: KnowledgeBase is GONE from this constructor. Retrieval no longer happens here — it
     // happens in CachedResolutionService, BEFORE the cache key is computed, because the key now
@@ -63,17 +69,18 @@ public class ResolverService {
     // mean embedding and searching twice per ticket, and the second result could differ from the one
     // the key was built from.
     public ResolverService (AnthropicClient client, ResolverPromptProvider prompts,
-                            CircuitBreakerRegistry circuitBreakers){
+                            CircuitBreakerRegistry circuitBreakers, ToolDefinitions tools){
         this.client = client;
         this.prompts = prompts;
         this.circuitBreakers = circuitBreakers;
+        this.tools = tools;
     }
 
     // Retry + circuit breaker apply here, on a PUBLIC method reached across a bean boundary
-    // (TicketController / ConversationRunner call it). That's mandatory: Spring implements these
-    // annotations with an AOP proxy, and a self-invocation (this.resolve()) would bypass the proxy
-    // and silently disable both policies. Resolve is safe to retry — it is a read (retrieve → ask),
-    // with no side effect to duplicate.
+    // (ResolverToolLoop calls it once per round). That's mandatory: Spring implements these
+    // annotations with an AOP proxy, and a self-invocation (this.ask()) would bypass the proxy and
+    // silently disable both policies. ask() is safe to retry — it is one model call with no side
+    // effect to duplicate; see the airbag note below for what had to leave this method to keep it so.
     //
     // The fallback degrades to human escalation on the two "Claude is unhealthy" paths — breaker open,
     // or a transient failure whose retries were exhausted — and RE-PROPAGATES everything else. It keys
@@ -93,34 +100,79 @@ public class ResolverService {
     // (a billable Voyage call) and re-run the search, so a Claude rate-limit blip would have cost
     // three embeddings, and a retry could have been answered from a DIFFERENT context than the one
     // the cache key was computed over.
+    //
+    // Day 17 — THE AIRBAG RULE (ADR-047, extending Day 8). What these annotations wrap shrank to ONE
+    // MODEL CALL: build the request, send it, classify the reply. The tool loop, the dispatch, and the
+    // G3/G4 gates all moved OUT, into ResolverToolLoop, which calls this method once per round across
+    // the bean boundary. That is not tidiness. A retried unit must be a pure read; "resolve" stopped
+    // being one the moment a round could create a ticket or queue a refund. Had dispatch stayed inside,
+    // a 429 on round two would have made Resilience4j replay round one's writes — and, symmetrically,
+    // a failing executor would have been counted by the breaker as Anthropic being down.
+    //
+    // What IS still inside, and why that is fine: G0 parsing. An unreadable end_turn payload is a
+    // property of this one response, retrying it re-sends the identical conversation (the
+    // ResolverConversation is immutable), and no tool runs in between.
     @Retry(name = CLAUDE, fallbackMethod = "escalateToHuman")
     @CircuitBreaker(name = CLAUDE)
-    public Resolution resolve(String ticket, ContextBlock context){
-        StructuredMessage<ResolverOutput> message = client.messages().create(paramsFor(ticket, context));
+    public ResolverTurn ask(ResolverConversation conversation) {
+        StructuredMessage<ResolverOutput> message = client.messages().create(paramsFor(conversation, true));
         logUsage(message.usage());
 
-        // stop_reason BEFORE parsing — the same gate the classifier uses (Day 6), and it matters MORE
-        // now than it did when this method returned prose: on "refusal" the content is empty and on
-        // "max_tokens" the JSON is truncated mid-object, so touching .text() first would surface both
-        // as a raw Jackson parse exception with the actual cause lost.
-        //
-        // Unlike the classifier, a bad stop_reason here does NOT degrade to a safe answer. The resolver
-        // has no neutral reply to fall back on — inventing one would break the prompt's own "never
-        // invent, never claim you did something" rule — and ESCALATED_TO_HUMAN is reserved for
+        // stop_reason BEFORE parsing — the same gate the classifier uses (Day 6): on "refusal" the
+        // content is empty and on "max_tokens" the JSON is truncated mid-object, so touching .text()
+        // first would surface both as a raw Jackson parse exception with the actual cause lost.
+        Optional<StopReason> stopReason = message.stopReason();
+
+        // Day 17: the model is asking us to act. Returned, not executed — this method never dispatches.
+        if (stopReason.isPresent() && StopReason.TOOL_USE.equals(stopReason.get())) {
+            return toolUseTurn(message);
+        }
+
+        // Day 17: our own cap was too small. RETURNED rather than thrown so the breaker records a
+        // SUCCESS — the dependency answered correctly; it was our fuse that blew (the G0 posture: a
+        // property of one response, never of Anthropic's health). The loop retries once with a raised
+        // cap and fails loud if that truncates too.
+        if (stopReason.isPresent() && StopReason.MAX_TOKENS.equals(stopReason.get())) {
+            return new ResolverTurn.Truncated();
+        }
+
+        // Anything else that is not end_turn (refusal, pause_turn, stop_sequence, absent) does NOT
+        // degrade to a safe answer. The resolver has no neutral reply to fall back on — inventing one
+        // would break the prompt's own "never invent" rule — and ESCALATED_TO_HUMAN is reserved for
         // dependency health, which this is not. So it surfaces: "fail loud on our mistakes, degrade
         // only on the dependency's". IllegalStateException is deliberately absent from the transient
         // allowlist, so escalateToHuman rethrows it rather than masking it as a bogus outage.
-        Optional<StopReason> stopReason = message.stopReason();
         if (stopReason.isEmpty() || !StopReason.END_TURN.equals(stopReason.get())) {
             throw new IllegalStateException("Resolver returned stop_reason="
                     + stopReason.map(StopReason::asString).orElse("<absent>") + " — no usable reply");
         }
 
-        // GATE 0 — the structured output must be READABLE. Everything below judges an answer; this
-        // judges whether there is one to judge. See parseOrThrow.
-        ResolverOutput output = parseOrThrow(message);
+        // GATE 0 — the structured output must be READABLE. G3/G4 judge an answer; this judges whether
+        // there is one to judge. See parseOrThrow.
+        return new ResolverTurn.Answered(parseOrThrow(message));
+    }
 
-        return applyGroundingGates(output, context);
+    /**
+     * A {@code tool_use} reply, split into what the loop needs: the assistant message VERBATIM (the
+     * API requires it echoed back before the results, and a paraphrase of it would be a different
+     * conversation) and every {@code tool_use} block in it.
+     *
+     * <p>Blocks are selected BY TYPE, never by position. A turn may open with a text block ("Let me
+     * check that order…") before its first {@code tool_use}, and may carry several {@code tool_use}
+     * blocks — so {@code content().get(0)} would be wrong on both counts, and wrong silently: it would
+     * either miss the call or dispatch only the first of two.
+     */
+    private ResolverTurn toolUseTurn(StructuredMessage<ResolverOutput> message) {
+        List<ToolUseBlock> calls = message.content().stream()
+                .filter(StructuredContentBlock::isToolUse)
+                .map(StructuredContentBlock::asToolUse)
+                .toList();
+        if (calls.isEmpty()) {
+            // stop_reason says "tool_use" and there is no tool_use block: a malformed response, which
+            // is G0's territory (retryable, then OUTPUT_UNUSABLE) rather than a bug of ours.
+            throw new ResolverOutputUnusableException("tool_use resolver response carried no tool_use block");
+        }
+        return new ResolverTurn.ToolUse(message.rawMessage().toParam(), calls);
     }
 
     /**
@@ -131,7 +183,7 @@ public class ResolverService {
      * Day 7's rule for this pair is "ONE prompt, TWO doors", and Day 10 held it for the REQUEST by
      * routing both transports through {@code paramsFor}. Day 16 put all of its new enforcement on the
      * RESPONSE, and there was no equivalent seam there — so the gates were reachable only from
-     * {@link #resolve}, and {@code /resolve/stream} shipped answers no gate had ever seen. The
+     * {@code resolve}, and {@code /resolve/stream} shipped answers no gate had ever seen. The
      * invariant was never written down as code, so it held exactly as long as nobody added anything
      * to the half it did not cover.
      *
@@ -313,13 +365,17 @@ public class ResolverService {
     // decision, exactly like the retry allowlist. A denylist would fail OPEN, silently masking an
     // unrecognised error as a bogus outage escalation.
     //
-    // The parameter list MIRRORS resolve()'s, plus the Throwable — that is how Resilience4j finds a
-    // fallback, and it is a match it makes reflectively at runtime. So adding ContextBlock to
-    // resolve() and forgetting it here would not fail to compile; it would fail at the first
+    // The parameter list MIRRORS ask()'s, plus the Throwable — that is how Resilience4j finds a
+    // fallback, and it is a match it makes reflectively at runtime. So adding a parameter to
+    // ask() and forgetting it here would not fail to compile; it would fail at the first
     // transient error, at which point the degrade path silently stops existing and a rate limit
     // becomes a 500. ResolverResilienceTest exercises this path for exactly that reason.
+    //
+    // Day 17: it returns a ResolverTurn.Degraded rather than a Resolution, because the unit it guards
+    // is now one model call. The loop turns that into the escalation — carrying any tools that already
+    // ran in earlier rounds, which is what keeps a round-2 outage after a round-1 lookup out of Redis.
     @SuppressWarnings("unused") // invoked reflectively by the Resilience4j @CircuitBreaker aspect
-    private Resolution escalateToHuman(String ticket, ContextBlock context, Throwable cause) throws Throwable {
+    private ResolverTurn escalateToHuman(ResolverConversation conversation, Throwable cause) throws Throwable {
         if (cause instanceof CallNotPermittedException) {
             var state = circuitBreakers.circuitBreaker(CLAUDE).getState();
             log.warn("Claude unavailable — circuit breaker '{}' is {}; escalating ticket to a human. cause={}",
@@ -357,18 +413,16 @@ public class ResolverService {
         if (cause instanceof ResolverOutputUnusableException) {
             log.warn("Claude returned an unreadable structured output and retries are exhausted; "
                     + "escalating ticket to a human. cause={}", cause.toString());
-            return Resolution.escalatedToHuman(EscalationCause.OUTPUT_UNUSABLE);
+            return new ResolverTurn.Degraded(EscalationCause.OUTPUT_UNUSABLE);
         }
         throw cause;
     }
 
-    // Delegates to the shared factory (Day 14): CachedResolutionService's retrieval catch produces the
-    // same degraded answer for a different unhealthy dependency, and the customer must not be able to
-    // tell the two apart from the wording. Note the empty source ledger it returns is correct here
-    // even though retrieval SUCCEEDED and a context block exists — this reply was produced instead of
-    // an answer, not from those documents.
-    private Resolution escalated() {
-        return Resolution.escalatedToHuman();
+    // The loop maps this onto the shared factory (Resolution.escalatedToHuman, Day 14):
+    // CachedResolutionService's retrieval catch produces the same degraded answer for a different
+    // unhealthy dependency, and the customer must not be able to tell the two apart from the wording.
+    private ResolverTurn escalated() {
+        return new ResolverTurn.Degraded(EscalationCause.DEPENDENCY_UNAVAILABLE);
     }
 
     // ADR-020: prompt-cache observability. cacheReadInputTokens > 0 means the static system-prompt
@@ -408,12 +462,20 @@ public class ResolverService {
     // separately maintained, free to drift from the blocking one in k, in budget, or in dedup. The
     // whole "ONE prompt, TWO doors" invariant below only holds if both doors are handed the same
     // shape of input, so the caller retrieves and both transports render identically.
+    //
+    // Day 17: the stream is TOOL-FREE — the one deliberate difference between the two doors. The SSE
+    // pump buffers one text envelope behind the gates (Day 16 Decision 4); it has no way to pause
+    // mid-stream, dispatch, and resume, so advertising tools there would let the model emit a
+    // tool_use nobody answers. Same system prompt, same schema; a streamed order-status question
+    // simply has no tool to reach for, so the model escalates rather than guesses (the prompt's
+    // transactional-facts clause forbids stating what no tool returned). Tool dispatch on SSE is a
+    // later-day item, not an accident of this line.
     public MessageCreateParams buildStreamingParams(String ticket, ContextBlock context) {
-        return paramsFor(ticket, context).rawParams();
+        return paramsFor(ResolverConversation.opening(ticket, context), false).rawParams();
     }
 
     // Single source of truth for the resolution prompt: model, token cap, system prompt, and the
-    // KB-augmented user turn. Both resolve() and buildStreamingParams() route through here so the
+    // KB-augmented user turn. Both ask() and buildStreamingParams() route through here so the
     // two transports can never drift apart in wording or configuration.
     //
     // Day 10 kept that invariant deliberately when the output became structured: ONE prompt, ONE
@@ -423,7 +485,10 @@ public class ResolverService {
     // enforcement: the model emits JSON anyway, unenforced and unparseable, straight onto a
     // customer-facing SSE stream. Splitting the transports would have meant splitting the prompt too,
     // which means two cache prefixes (ADR-020) and a live drift seam.
-    private StructuredMessageCreateParams<ResolverOutput> paramsFor(String ticket, ContextBlock context) {
+    private StructuredMessageCreateParams<ResolverOutput> paramsFor(ResolverConversation conversation,
+                                                                    boolean withTools) {
+        String ticket = conversation.ticket();
+        ContextBlock context = conversation.context();
         // ORDER IS THE DESIGN: documents first, ticket LAST.
         //
         // Not a formatting preference. The ticket is the only part of this turn the customer controls,
@@ -439,9 +504,12 @@ public class ResolverService {
         // anything the assembler can see.
         String userTurn = context.rendered() + "\n\ncustomer ticket: " + ticket;
 
-        return MessageCreateParams.builder()
+        StructuredMessageCreateParams.Builder<ResolverOutput> request = MessageCreateParams.builder()
                 .model(Model.CLAUDE_SONNET_4_5)   // MODEL_ID = this constant's .asString(); one source, no drift
-                .maxTokens(MAX_TOKENS)
+                // MAX_TOKENS unless the loop raised it after a truncation (Day 17). The KEY still folds
+                // MAX_TOKENS: the raise is a deterministic policy applied to the same inputs, not a
+                // different request a caller chose.
+                .maxTokens(conversation.maxTokens())
                 .temperature(TEMPERATURE)
                 // ADR-020: mark the static system prompt (rules + few-shot + the Day 14 grounding
                 // block — the STABLE prefix) with an ephemeral cache_control breakpoint. Replaces the
@@ -471,7 +539,19 @@ public class ResolverService {
                 // and its position in this chain has no effect on what gets cached.
                 .outputConfig(ResolverOutput.class)
                 // The ticket goes in messages — AFTER the breakpoint, never cached.
-                .addUserMessage(userTurn)
-                .build();
+                .addUserMessage(userTurn);
+
+        // Day 17: the tool-loop turns, appended AFTER the opening user turn and in order — each
+        // assistant message verbatim, then the one user message holding all of its tool results.
+        conversation.followUps().forEach(request::addMessage);
+
+        // Day 17 (ADR-045): tools render at the very start of the cache prefix (tools → system →
+        // messages), so they are a PREFIX input. ToolDefinitions hands them over sorted by name with
+        // ordered schema maps, so these bytes are identical on every request and the ADR-020 prefix
+        // keeps hitting.
+        if (withTools) {
+            request.tools(tools.toolUnions());
+        }
+        return request.build();
     }
 }

@@ -10,6 +10,7 @@ import com.anthropic.models.messages.StructuredTextBlock;
 import org.aura.aura.ResolverPromptProvider;
 import org.aura.aura.resolver.Resolution;
 import org.aura.aura.resolver.ResolverService;
+import org.aura.aura.resolver.ResolverToolLoop;
 import org.aura.aura.retrieval.ContextBlock;
 import org.aura.aura.retrieval.RetrievalService;
 import org.junit.jupiter.api.Tag;
@@ -85,14 +86,14 @@ class GroundingBeforeAfterRunner extends org.aura.aura.PostgresBackedContext {
     private static final String FROZEN_PROMPT = "prompts/resolver_system_prompt_v4_frozen.md";
 
     private final AnthropicClient client;
-    private final ResolverService resolver;
+    private final ResolverToolLoop resolver;
     private final RetrievalService retrieval;
     private final ResolverPromptProvider afterPrompts;
 
     private final EvalScorer scorer = new EvalScorer();
 
     @Autowired
-    GroundingBeforeAfterRunner(AnthropicClient client, ResolverService resolver,
+    GroundingBeforeAfterRunner(AnthropicClient client, ResolverToolLoop resolver,
                                RetrievalService retrieval, ResolverPromptProvider afterPrompts) {
         this.client = client;
         this.resolver = resolver;
