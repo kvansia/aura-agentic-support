@@ -8,6 +8,7 @@ import org.aura.aura.client.VoyageTransientException;
 import org.aura.aura.retrieval.ContextBlock;
 import org.aura.aura.retrieval.RetrievalService;
 import org.aura.aura.retrieval.SourceRef;
+import org.aura.aura.tools.ToolDefinitions;
 import org.aura.aura.web.dto.ResolveTicketRequest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -54,8 +55,9 @@ class CachedResolutionServiceTest {
     @Mock RetrievalService retrieval;
     @Mock CacheKeyFactory keys;
     @Mock ResolutionCache cache;
-    @Mock ResolverService resolver;
+    @Mock ResolverToolLoop resolver;
     @Mock ResolverPromptProvider prompts;
+    @Mock ToolDefinitions tools;
 
     @InjectMocks CachedResolutionService service;
 
@@ -310,6 +312,72 @@ class CachedResolutionServiceTest {
         when(retrieval.retrieve(TICKET)).thenThrow(ours);
 
         assertThatThrownBy(() -> service.resolve(REQUEST)).isSameAs(ours);
+    }
+
+    // ---------------------------------------------------------------- Day 17: tools (ADR-047)
+
+    // POLICY: nothing a tool touched is written to Redis — even a perfectly good RESOLVED answer. The
+    // key cannot see the order system's state (staleness) or who asked (cross-user replay).
+    @Test
+    void aToolTouchedResolutionIsNeverCached() {
+        Resolution touched = resolution("SF-4412 shipped yesterday.", ResolutionStatus.RESOLVED)
+                .withToolsInvoked(List.of("get_order_status"));
+        stubKey();
+        when(retrieval.retrieve(TICKET)).thenReturn(CONTEXT);
+        when(cache.get(KEY)).thenReturn(Optional.empty());
+        when(resolver.resolve(TICKET, CONTEXT)).thenReturn(touched);
+
+        Resolution result = service.resolve(REQUEST);
+
+        assertThat(result).isSameAs(touched);
+        verify(cache, never()).put(any(), any());
+    }
+
+    // POLICY: the skip is on ANY tool having run, not on the kind of outcome. A grounding refusal is
+    // normally cached (Day 16) — but one written after a lookup was shaped by live data, so it is not.
+    @Test
+    void aGroundingRefusalAfterAToolIsNotCachedEither() {
+        Resolution refusedAfterLookup = Resolution.escalatedUngrounded(EscalationCause.UNGROUNDED)
+                .withToolsInvoked(List.of("get_order_status"));
+        stubKey();
+        when(retrieval.retrieve(TICKET)).thenReturn(CONTEXT);
+        when(cache.get(KEY)).thenReturn(Optional.empty());
+        when(resolver.resolve(TICKET, CONTEXT)).thenReturn(refusedAfterLookup);
+
+        service.resolve(REQUEST);
+
+        verify(cache, never()).put(any(), any());
+    }
+
+    // POLICY: the other half — a tool-FREE ticket is cached exactly as before Day 17.
+    @Test
+    void aToolFreeResolutionIsStillCached() {
+        Resolution toolFree = resolution("Within 30 days.", ResolutionStatus.RESOLVED);
+        stubKey();
+        when(retrieval.retrieve(TICKET)).thenReturn(CONTEXT);
+        when(cache.get(KEY)).thenReturn(Optional.empty());
+        when(resolver.resolve(TICKET, CONTEXT)).thenReturn(toolFree);
+
+        service.resolve(REQUEST);
+
+        assertThat(toolFree.toolTouched()).isFalse();
+        verify(cache).put(KEY, toolFree);
+    }
+
+    // POLICY: the advertised tools are keyed as part of the static prefix, AHEAD of the system prompt
+    // (the order the API renders them) — so a tool edit orphans keys exactly like a prompt edit.
+    @Test
+    void theToolAdvertisementIsKeyedAheadOfTheSystemPrompt() {
+        when(tools.canonicalForm()).thenReturn("[TOOLS]");
+        when(prompts.systemPrompt()).thenReturn("SYSTEM");
+        stubKey();
+        when(retrieval.retrieve(TICKET)).thenReturn(CONTEXT);
+        when(cache.get(KEY)).thenReturn(Optional.of(resolution("cached", ResolutionStatus.RESOLVED)));
+
+        service.resolve(REQUEST);
+
+        verify(keys).resolutionKey(any(), any(), anyInt(), eq("[TOOLS]SYSTEM"), any(), any(),
+                anyDouble(), anyLong());
     }
 
     // ---------------------------------------------------------------- fixtures

@@ -30,7 +30,8 @@ public record Resolution(String answer,
                          List<SourceRef> sourcesCited,
                          ResolutionStatus status,
                          EscalationCause escalationCause,
-                         boolean escalate) {
+                         boolean escalate,
+                         List<String> toolsInvoked) {
 
     /**
      * Null-tolerant, and this is about REDIS rather than about callers.
@@ -55,6 +56,32 @@ public record Resolution(String answer,
         sourcesProvided = sourcesProvided == null ? List.of() : List.copyOf(sourcesProvided);
         sourcesCited = sourcesCited == null ? List.of() : List.copyOf(sourcesCited);
         escalationCause = escalationCause == null ? EscalationCause.NONE : escalationCause;
+        // Day 17, the same null-tolerance for the same reason: pre-Day-17 cache entries have no
+        // toolsInvoked, and "no tools ran" is exactly the honest reading of them — a tool-touched
+        // resolution is never written to Redis (ADR-047), so every readable entry is a tool-free one.
+        toolsInvoked = toolsInvoked == null ? List.of() : List.copyOf(toolsInvoked);
+    }
+
+    /**
+     * Day 17 — did any tool execute while producing this outcome? (ADR-047)
+     *
+     * <p>The cache gate reads this, and it is deliberately a second question beside
+     * {@link #isIncidentalOutcome()} rather than folded into it. A tool-touched answer is not
+     * incidental — "SF-4412 shipped yesterday" may be perfectly correct — it is UNKEYABLE: the key
+     * hashes the prompt, the ticket and the retrieved bytes, and none of those captures the order
+     * system's state or whose order it is. Caching it would serve a stale status after the parcel
+     * moves, and would replay one customer's order facts to anyone who typed the same sentence.
+     *
+     * <p>Not named {@code isX}/{@code getX} on purpose: Jackson would otherwise serialize it into the
+     * cached JSON as a phantom property.
+     */
+    public boolean toolTouched() {
+        return !toolsInvoked.isEmpty();
+    }
+
+    /** The same outcome, stamped with the tools that ran (in dispatch order, repeats kept). */
+    public Resolution withToolsInvoked(List<String> tools) {
+        return new Resolution(answer, sourcesProvided, sourcesCited, status, escalationCause, escalate, tools);
     }
 
     /**
@@ -85,7 +112,7 @@ public record Resolution(String answer,
     public static Resolution resolved(String answer, List<SourceRef> sourcesProvided,
                                       List<SourceRef> sourcesCited, boolean escalate) {
         return new Resolution(answer, sourcesProvided, sourcesCited,
-                ResolutionStatus.RESOLVED, EscalationCause.NONE, escalate);
+                ResolutionStatus.RESOLVED, EscalationCause.NONE, escalate, List.of());
     }
 
     /**
@@ -117,7 +144,8 @@ public record Resolution(String answer,
                 // BOTH channels true, and that is not redundancy. `status` records that a human is
                 // taking over; `escalate` records WHAT the caller must now do (route to a human), so
                 // downstream code reading only `escalate` still behaves correctly during an outage.
-                true);
+                true,
+                List.of());
     }
 
     /**
@@ -142,7 +170,8 @@ public record Resolution(String answer,
                 List.of(),
                 ResolutionStatus.ESCALATED_TO_HUMAN,
                 cause,
-                true);
+                true,
+                List.of());
     }
 }
 // Day 6 extends this (category/urgency/intent). Day 24 extends it (tokens/cost/model).
@@ -157,3 +186,5 @@ public record Resolution(String answer,
 // used" are two facts and the system now knows both; the second because ESCALATED_TO_HUMAN acquired
 // three writers with two different cache policies, and one value meaning three things is the defect
 // every rename above was undoing.
+// Day 17 added `toolsInvoked`: the audit of which tools executed on the way to this outcome, and the
+// signal the cache gate needs — a tool-touched resolution is never cached (ADR-047).

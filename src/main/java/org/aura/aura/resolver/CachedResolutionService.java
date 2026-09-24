@@ -7,6 +7,7 @@ import org.aura.aura.cache.ResolutionCache;
 import org.aura.aura.client.VoyageTransientException;
 import org.aura.aura.retrieval.ContextBlock;
 import org.aura.aura.retrieval.RetrievalService;
+import org.aura.aura.tools.ToolDefinitions;
 import org.aura.aura.web.dto.ResolveTicketRequest;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.dao.QueryTimeoutException;
@@ -29,22 +30,29 @@ public class CachedResolutionService {
     // used a plain `this.` call, the proxy would be bypassed and the resilience stack
     // would silently vanish while every client-mocking test still passed (Day 8 pitfall,
     // now made structurally impossible).
-    private final ResolverService resolver;
+    //
+    // Day 17: this is the TOOL LOOP now, not ResolverService directly. The loop calls the proxied
+    // ResolverService once per round, so the same property holds one layer further down.
+    private final ResolverToolLoop resolver;
     // The static system prompt (one of the answer-affecting key inputs) is read HERE from the
     // shared provider, NOT from `resolver` — deliberately, so a cache HIT never touches the resolver
     // bean (that's what lets the outage path "OPEN + hit => real answer" hold, and what
     // verifyNoInteractions(resolver) asserts). Same provider ResolverService.paramsFor uses, so the
     // keyed prefix is byte-identical to the one that carries the cache_control breakpoint.
     private final ResolverPromptProvider prompts;
+    // Day 17: the advertised tools are part of the same static prefix as the system prompt (they render
+    // AHEAD of it), so they are keyed alongside it — see ToolDefinitions.canonicalForm().
+    private final ToolDefinitions tools;
 
     public CachedResolutionService(RetrievalService retrieval, CacheKeyFactory keys,
-                                   ResolutionCache cache, ResolverService resolver,
-                                   ResolverPromptProvider prompts) {
+                                   ResolutionCache cache, ResolverToolLoop resolver,
+                                   ResolverPromptProvider prompts, ToolDefinitions tools) {
         this.retrieval = retrieval;
         this.keys = keys;
         this.cache = cache;
         this.resolver = resolver;
         this.prompts = prompts;
+        this.tools = tools;
     }
 
     public Resolution resolve(ResolveTicketRequest request) {
@@ -75,7 +83,10 @@ public class CachedResolutionService {
                 ResolverService.MODEL_ID,
                 prompts.promptId(),
                 prompts.promptVersion(),
-                prompts.systemPrompt(),
+                // The STATIC PREFIX, in the order the API renders it: tools, then system. Folded into the
+                // existing slot rather than a new parameter because it is one input — "everything ahead
+                // of the per-request turn" — and a tool edit must orphan keys exactly like a prompt edit.
+                tools.canonicalForm() + prompts.systemPrompt(),
                 context.rendered(),
                 ticketText,
                 ResolverService.TEMPERATURE,
@@ -119,8 +130,18 @@ public class CachedResolutionService {
         // isIncidentalOutcome() is what keeps the two apart: it is true for a dependency failure and
         // for an unreadable response (both properties of one call), false for a grounding refusal (a
         // property of the question). See EscalationCause.
-        if (!fresh.isIncidentalOutcome()) {
+        //
+        // DAY 17 (ADR-047): and nothing a TOOL touched is cached, whatever its outcome. Two reasons, and
+        // either alone would be enough. STALENESS — the key covers prompt, ticket and retrieved bytes,
+        // not the order system, so "SF-4412 is in transit" would keep being served after it is
+        // delivered. CROSS-USER REPLAY — the key does not know who asked, so the next customer to type
+        // the same sentence would be told the first customer's order status. The skip is on ANY tool
+        // having run, not on the kind of answer: a G3 refusal written after a lookup is still an outcome
+        // the tool result shaped.
+        if (!fresh.isIncidentalOutcome() && !fresh.toolTouched()) {
             cache.put(key, fresh);
+        } else if (fresh.toolTouched()) {
+            log.info("tool-touched resolution NOT cached (ADR-047) — tools={} key={}", fresh.toolsInvoked(), key);
         }
         return fresh;
     }

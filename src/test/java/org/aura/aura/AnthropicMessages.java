@@ -90,6 +90,40 @@ final class AnthropicMessages {
                         + ",\"escalate\":false,\"grounded\":true}");
     }
 
+    /**
+     * Day 17: a resolver turn that asks for a tool — {@code stop_reason=tool_use}, a short text block
+     * FIRST (the realistic shape, and the one that catches index-[0] bugs), then the {@code tool_use}.
+     * Built to the documented Messages API shape and validated, like {@link #ok200}, by round-tripping
+     * through the SDK's own parser.
+     */
+    static MockResponse resolverToolUse(String toolUseId, String toolName, String inputJson) {
+        ObjectNode root = MAPPER.createObjectNode();
+        root.put("id", "msg_it_tool");
+        root.put("type", "message");
+        root.put("role", "assistant");
+        root.put("model", "claude-sonnet-4-5");
+        var content = root.putArray("content");
+        content.addObject().put("type", "text").put("text", "Let me look that order up.");
+        ObjectNode call = content.addObject();
+        call.put("type", "tool_use");
+        call.put("id", toolUseId);
+        call.put("name", toolName);
+        try {
+            call.set("input", MAPPER.readTree(inputJson));
+        } catch (Exception e) {
+            throw new IllegalArgumentException("tool input fixture is not JSON: " + inputJson, e);
+        }
+        root.put("stop_reason", "tool_use");
+        root.putNull("stop_sequence");
+        ObjectNode usage = root.putObject("usage");
+        usage.put("input_tokens", 100);
+        usage.put("output_tokens", 20);
+        return new MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "application/json")
+                .setBody(writeString(root));
+    }
+
     // A resolver success whose BODY is delayed — the "hang" simulation. The delay lives in the script;
     // the test asserts an OUTCOME, never elapsed time.
     static MockResponse resolverOkDelayed(Duration delay, String... citedChunkIds) {

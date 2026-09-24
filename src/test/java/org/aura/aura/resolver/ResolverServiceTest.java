@@ -15,6 +15,8 @@ import org.aura.aura.retrieval.ContextBlock;
 import org.aura.aura.retrieval.ContextBlockAssembler;
 import org.aura.aura.retrieval.RetrievedChunk;
 import org.aura.aura.retrieval.SourceRef;
+import org.aura.aura.tools.ToolDefinitions;
+import org.aura.aura.tools.ToolFixtures;
 import org.junit.jupiter.api.Test;
 import org.springframework.core.io.ClassPathResource;
 
@@ -57,8 +59,15 @@ class ResolverServiceTest {
     private final AnthropicClient client = mock(AnthropicClient.class, RETURNS_DEEP_STUBS);
     private final ContextBlockAssembler assembler = new ContextBlockAssembler();
 
-    private ResolverService resolver() {
-        return new ResolverService(client, prompts(), CircuitBreakerRegistry.ofDefaults());
+    private ResolverService service() {
+        return new ResolverService(client, prompts(), CircuitBreakerRegistry.ofDefaults(), new ToolDefinitions());
+    }
+
+    // Day 17: resolve() lives on the tool loop, which wraps ResolverService.ask(). Every stub below
+    // answers end_turn, so the loop runs exactly one round and these tests keep measuring what they
+    // always measured — the gates and the request — with the loop as a pass-through.
+    private ResolverToolLoop resolver() {
+        return new ResolverToolLoop(service(), ToolFixtures.registry());
     }
 
     private static ResolverPromptProvider prompts() {
@@ -416,7 +425,7 @@ class ResolverServiceTest {
      * is what the blocking path sends too.
      */
     private MessageCreateParams params(ContextBlock context) {
-        return resolver().buildStreamingParams(RETURNS_TICKET, context);
+        return service().buildStreamingParams(RETURNS_TICKET, context);
     }
 
     private static String systemPrefix(MessageCreateParams params) {

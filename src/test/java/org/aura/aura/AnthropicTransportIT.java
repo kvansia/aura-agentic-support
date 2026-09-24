@@ -32,6 +32,7 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.io.IOException;
 import java.time.Duration;
+import java.util.concurrent.TimeUnit;
 
 import static org.aura.aura.AnthropicMessages.classifierOk;
 import static org.aura.aura.AnthropicMessages.error;
@@ -347,6 +348,61 @@ class AnthropicTransportIT extends PostgresBackedContext {
         // because they answer separate questions; here they happen to agree because one excerpt was
         // seeded and it was the one cited.
         assertThat(array(resp, "sourcesProvided")).hasSize(1);
+    }
+
+    /**
+     * IT-8 (Day 17): one tool round, end to end, through the REAL SDK transport. The scripted model
+     * asks for {@code get_order_status(SF-4412)}, then answers.
+     *
+     * <p>What only a full-stack test can prove: that the request we send after dispatch is a legal
+     * Messages API conversation as the SDK serializes it — the assistant turn echoed with its
+     * {@code tool_use} block, then a user turn whose {@code tool_result} carries the matching id and the
+     * seeded, allowlisted order facts — and that the final answer still flows through G3/G4 and the
+     * response DTO like any other.
+     */
+    @Test
+    void it8_toolRound_dispatchesThroughTheRealTransport_andTheAnswerStillPassesTheGates() throws Exception {
+        drainRecordedRequests();
+        ANTHROPIC.enqueue(classifierOk());
+        ANTHROPIC.enqueue(AnthropicMessages.resolverToolUse(
+                "toolu_it8", "get_order_status", "{\"order_id\":\"SF-4412\"}"));
+        ANTHROPIC.enqueue(resolverOk(KbFixtures.GROUNDING_CHUNK_ID.toString()));
+
+        ResponseEntity<String> resp = resolve(rest, "it8", "Where is my order SF-4412?");
+
+        assertThat(resp.getStatusCode().value()).isEqualTo(200);
+        assertThat(field(resp, "outcome")).isEqualTo("RESOLVED");
+        assertThat(field(resp, "resolutionText")).isEqualTo(RESOLVER_REPLY);
+
+        ANTHROPIC.takeRequest(1, TimeUnit.SECONDS);                                   // classifier
+        JsonNode firstResolverCall = AnthropicMessages.MAPPER.readTree(
+                ANTHROPIC.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8());
+        JsonNode secondResolverCall = AnthropicMessages.MAPPER.readTree(
+                ANTHROPIC.takeRequest(1, TimeUnit.SECONDS).getBody().readUtf8());
+
+        // The advertisement, sorted by name, is on the wire.
+        assertThat(firstResolverCall.path("tools").findValuesAsText("name"))
+                .containsExactly("create_followup_ticket", "get_order_status", "initiate_refund");
+
+        // user → assistant(tool_use, echoed) → user(tool_result)
+        JsonNode messages = secondResolverCall.path("messages");
+        assertThat(messages).hasSize(3);
+        assertThat(messages.get(1).path("role").asText()).isEqualTo("assistant");
+        assertThat(messages.get(1).path("content").findValuesAsText("id")).contains("toolu_it8");
+        JsonNode result = messages.get(2).path("content").get(0);
+        assertThat(result.path("type").asText()).isEqualTo("tool_result");
+        assertThat(result.path("tool_use_id").asText()).isEqualTo("toolu_it8");
+        assertThat(result.path("is_error").asBoolean()).isFalse();
+        JsonNode order = AnthropicMessages.MAPPER.readTree(result.path("content").asText());
+        assertThat(order.path("status").asText()).isEqualTo("shipped");
+        assertThat(order.path("carrier").asText()).isEqualTo("FastShip");
+    }
+
+    /** MockWebServer records every request for the life of the class; start IT-8 from an empty log. */
+    private static void drainRecordedRequests() throws InterruptedException {
+        while (ANTHROPIC.takeRequest(10, TimeUnit.MILLISECONDS) != null) {
+            // discard earlier scenarios' requests
+        }
     }
 
     /** A scripted "the excerpts do not answer this" envelope: grounded=false, nothing cited. */
