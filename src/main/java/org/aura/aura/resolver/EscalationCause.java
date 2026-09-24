@@ -60,7 +60,15 @@ public enum EscalationCause {
      * retry budget was spent. Grounding cannot be verified on an answer that cannot be read, and an
      * unverifiable answer must not reach a customer.
      */
-    OUTPUT_UNUSABLE;
+    OUTPUT_UNUSABLE,
+
+    /**
+     * Day 17 — the model was still asking for tools when the loop's round budget
+     * ({@code ResolverToolLoop.MAX_TOOL_ROUNDS}) ran out. INCIDENT-SHAPED: it describes how one
+     * conversation went (a model stuck re-querying, a tool answering something it could not use), not
+     * a fact about the ticket, so it is never cached — the next attempt may well finish in one round.
+     */
+    TOOL_ROUNDS_EXHAUSTED;
 
     /**
      * True when this escalation is a property of THIS ONE CALL rather than of the ticket and the
@@ -74,6 +82,6 @@ public enum EscalationCause {
      * already covers (the prompt, the ticket, the retrieved bytes), so they repeat.
      */
     public boolean isIncidental() {
-        return this == DEPENDENCY_UNAVAILABLE || this == OUTPUT_UNUSABLE;
+        return this == DEPENDENCY_UNAVAILABLE || this == OUTPUT_UNUSABLE || this == TOOL_ROUNDS_EXHAUSTED;
     }
 }

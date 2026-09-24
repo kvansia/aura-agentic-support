@@ -260,6 +260,7 @@ class ResolverResilienceTest {
         Resolution resolution = resolver.resolve(TICKET, CONTEXT);
 
         assertThat(resolution.status()).isEqualTo(ResolutionStatus.RESOLVED);
+        assertThat(resolution.toolsInvoked()).containsExactly("create_followup_ticket");
         // round 1 (1) + round 2 [429, 200] (2) = 3 model calls ...
         verify(client.messages(), times(3)).create(any(StructuredMessageCreateParams.class));
         // ... and exactly ONE ticket.

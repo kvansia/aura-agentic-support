@@ -33,7 +33,6 @@ import static org.aura.aura.resolver.ToolTurns.toolUse;
 import static org.aura.aura.resolver.ToolTurns.toolUseTurn;
 import static org.aura.aura.tools.ToolFixtures.json;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -73,6 +72,8 @@ class ResolverToolLoopTest {
 
         assertThat(resolution.status()).isEqualTo(ResolutionStatus.RESOLVED);
         assertThat(resolution.answer()).contains("FastShip");
+        assertThat(resolution.toolsInvoked()).containsExactly("get_order_status");
+        assertThat(resolution.toolTouched()).isTrue();
 
         List<StructuredMessageCreateParams<ResolverOutput>> requests = requests(2);
         List<MessageParam> second = requests.get(1).rawParams().messages();
@@ -101,6 +102,7 @@ class ResolverToolLoopTest {
 
         Resolution resolution = loop().resolve(TICKET, context);
 
+        assertThat(resolution.toolsInvoked()).containsExactly("get_order_status", "get_order_status");
         List<MessageParam> second = requests(2).get(1).rawParams().messages();
         assertThat(second).as("ONE user message for the whole turn, not one per result").hasSize(3);
         assertThat(second.get(2).role()).isEqualTo(MessageParam.Role.USER);
@@ -117,16 +119,21 @@ class ResolverToolLoopTest {
     // ---------------------------------------------------------------- the round cap
 
     @Test
-    void aModelThatNeverStopsAskingIsStoppedAtTheCap() {
+    void aModelThatNeverStopsAskingIsEscalatedAtTheCap_asAnIncident() {
         when(client.messages().create(any(StructuredMessageCreateParams.class)))
                 .thenAnswer(call -> toolUseTurn(toolUse("toolu_" + UUID.randomUUID(), "get_order_status",
                         "{\"order_id\":\"SF-4412\"}")));
 
-        assertThatThrownBy(() -> loop().resolve(TICKET, context))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessageContaining("exhausted");
+        Resolution resolution = loop().resolve(TICKET, context);
+
+        assertThat(resolution.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
+        assertThat(resolution.escalationCause()).isEqualTo(EscalationCause.TOOL_ROUNDS_EXHAUSTED);
+        // Incident-shaped: never cached (Day 16 differential policy), on either count.
+        assertThat(resolution.isIncidentalOutcome()).isTrue();
+        assertThat(resolution.toolTouched()).isTrue();
         // MAX_TOOL_ROUNDS dispatched rounds, MAX_TOOL_ROUNDS + 1 model calls — the last request is
         // never answered.
+        assertThat(resolution.toolsInvoked()).hasSize(ResolverToolLoop.MAX_TOOL_ROUNDS);
         verify(client.messages(), times(ResolverToolLoop.MAX_TOOL_ROUNDS + 1))
                 .create(any(StructuredMessageCreateParams.class));
     }
@@ -173,6 +180,8 @@ class ResolverToolLoopTest {
         Resolution resolution = loop().resolve(TICKET, context);
 
         assertThat(resolution.escalationCause()).isEqualTo(EscalationCause.UNVERIFIABLE_CITATIONS);
+        // A grounding refusal would normally be cached; after a tool it must not be.
+        assertThat(resolution.toolTouched()).isTrue();
     }
 
     @Test
@@ -193,6 +202,7 @@ class ResolverToolLoopTest {
 
         Resolution resolution = loop().resolve("How long does shipping take?", context);
 
+        assertThat(resolution.toolTouched()).isFalse();
         assertThat(requests(1).getFirst().rawParams().tools().orElseThrow())
                 .extracting(tool -> tool.asTool().name())
                 .containsExactly("create_followup_ticket", "get_order_status", "initiate_refund");

@@ -38,7 +38,8 @@ import java.util.List;
  *
  * <h2>What leaves this class</h2>
  * The final {@code end_turn} answer goes through G3/G4 ({@link ResolverService#applyGroundingGates})
- * UNCHANGED — tool use adds no bypass.
+ * UNCHANGED — tool use adds no bypass. Every outcome, including every escalation, is stamped with the
+ * tools that ran, and {@link Resolution#toolTouched()} is what keeps any of it out of Redis.
  */
 @Slf4j
 @Service
@@ -68,27 +69,35 @@ public class ResolverToolLoop {
     }
 
     public Resolution resolve(String ticket, ContextBlock context) {
+        List<String> toolsInvoked = new ArrayList<>();
+
         Asked asked = askOnce(ResolverConversation.opening(ticket, context));
         int round = 0;
         while (asked.turn() instanceof ResolverTurn.ToolUse toolUse && round < MAX_TOOL_ROUNDS) {
             // The assistant message goes back VERBATIM and FIRST, then exactly ONE user message holding
             // every result. Splitting results across user messages, or answering only some blocks, is a
             // protocol error — and results answer blocks by tool_use_id, never by position.
-            MessageParam results = dispatchAll(toolUse.calls());
+            MessageParam results = dispatchAll(toolUse.calls(), toolsInvoked);
             round++;
             asked = askOnce(asked.conversation().append(toolUse.assistant(), results));
         }
 
-        return switch (asked.turn()) {
+        Resolution outcome = switch (asked.turn()) {
             // G3/G4 UNCHANGED: a tool-assisted answer earns no exemption from the grounding gates.
             case ResolverTurn.Answered answered -> resolver.applyGroundingGates(answered.output(), context);
             case ResolverTurn.Degraded degraded -> Resolution.escalatedToHuman(degraded.cause());
-            case ResolverTurn.ToolUse stillAsking -> throw new IllegalStateException(
-                    "tool loop exhausted " + MAX_TOOL_ROUNDS + " round(s) with the model still requesting "
-                            + stillAsking.calls().stream().map(ToolUseBlock::name).toList());
+            case ResolverTurn.ToolUse stillAsking -> {
+                // INCIDENT-SHAPED, and logged like one: WARN, naming what the model kept asking for.
+                log.warn("tool loop exhausted {} round(s) with the model still requesting {}; escalating "
+                                + "ticket to a human. invoked={}",
+                        MAX_TOOL_ROUNDS, stillAsking.calls().stream().map(ToolUseBlock::name).toList(),
+                        toolsInvoked);
+                yield Resolution.escalatedToHuman(EscalationCause.TOOL_ROUNDS_EXHAUSTED);
+            }
             case ResolverTurn.Truncated truncated ->
                     throw new IllegalStateException("unreachable: askOnce resolves every truncation");
         };
+        return outcome.withToolsInvoked(toolsInvoked);
     }
 
     /**
@@ -128,10 +137,11 @@ public class ResolverToolLoop {
      * several calls in one turn — not a threading requirement; running a write concurrently with the
      * read it may depend on would buy nothing here and cost determinism.
      */
-    private MessageParam dispatchAll(List<ToolUseBlock> calls) {
+    private MessageParam dispatchAll(List<ToolUseBlock> calls, List<String> toolsInvoked) {
         List<ContentBlockParam> results = new ArrayList<>(calls.size());
         for (ToolUseBlock call : calls) {
             ToolResultPayload payload = tools.dispatch(call.name(), call.id(), inputOf(call));
+            toolsInvoked.add(call.name());
             log.info("tool dispatched — name={}, tool_use_id={}, is_error={}", call.name(), call.id(),
                     payload.isError());
             results.add(ContentBlockParam.ofToolResult(ToolResultBlockParam.builder()
